@@ -1,0 +1,149 @@
+{
+  "name": "Airtable Backup - Optimized (3-5 API Calls)",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "airtable-backup-webhook",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "id": "572cb701-12ef-4532-8bc3-b285cd6d0eb9",
+      "name": "Webhook - Airtable Trigger",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -1296,
+        -112
+      ],
+      "webhookId": "airtable-backup-webhook"
+    },
+    {
+      "parameters": {
+        "jsCode": "const AIRTABLE_TOKEN = 'YOUR_TOKEN';\nconst BASE_ID = 'apprJuNN7cJybIziP';\nconst WEBHOOK_ID = 'ach1yRrkXAbUndxBU'; // ← Paste your webhook ID here\n\nconst TABLE_CONFIG = [\n  {\n    tableLabel: 'Products',\n    sourceBaseId: 'apprJuNN7cJybIziP',\n    sourceTableId: 'tbl3ONmeGLiaMoeRR',\n    backupBaseId: 'appAOHsB7wbh1oc7w',\n    backupTableId: 'tblMonZkhAGAqge3V',\n    fields: ['Name', 'Status', 'Price', 'Notes']\n  },\n  {\n    tableLabel: 'Orders',\n    sourceBaseId: 'apprJuNN7cJybIziP',\n    sourceTableId: 'tblTIFYe8RUiMuWJf',\n    backupBaseId: 'appAOHsB7wbh1oc7w',\n    backupTableId: 'tbl2UhrlXMlygYrfg',\n    fields: ['Name', 'Status', 'Customer', 'Amount'] // ✅ Fixed fields\n  },\n  {\n    tableLabel: 'Customers',\n    sourceBaseId: 'apprJuNN7cJybIziP',\n    sourceTableId: 'tblp1XLLYbmWEV4DR',\n    backupBaseId: 'appAOHsB7wbh1oc7w',\n    backupTableId: 'tbldyD5a4q5v9huBN',\n    fields: ['Name', 'Status', 'Phone', 'Email']\n  }\n];\n\n// ============================================================\n// API CALL 1 — Immediately fetch payloads\n// ============================================================\nlet changesResponse;\ntry {\n  changesResponse = await this.helpers.httpRequest({\n    method: 'GET',\n    url: `https://api.airtable.com/v0/bases/${BASE_ID}/webhooks/${WEBHOOK_ID}/payloads`,\n    headers: { 'Authorization': `Bearer ${AIRTABLE_TOKEN}` },\n    json: true\n  });\n} catch (err) {\n  throw new Error(`Failed to fetch webhook payloads: ${err.message}`);\n}\n\nconst payloads = changesResponse.payloads || [];\nconst cursor = changesResponse.cursor;\n\n// ============================================================\n// API CALL 2 — Acknowledge IMMEDIATELY\n// This makes all other parallel executions skip themselves\n// ============================================================\nif (cursor) {\n  try {\n    await this.helpers.httpRequest({\n      method: 'POST',\n      url: `https://api.airtable.com/v0/bases/${BASE_ID}/webhooks/${WEBHOOK_ID}/payloads/acknowledge`,\n      headers: {\n        'Authorization': `Bearer ${AIRTABLE_TOKEN}`,\n        'Content-Type': 'application/json'\n      },\n      body: { cursor },\n      json: true\n    });\n  } catch (err) {\n    console.error('Acknowledge failed:', err.message);\n  }\n}\n\nif (payloads.length === 0) {\n  return [{ json: { __skip: true, message: 'No payloads — already handled by another execution' } }];\n}\n\n// Collect unique record IDs from payloads\nconst recordMap = new Map();\n\nfor (const payload of payloads) {\n  const changedTablesObj = payload?.changedTablesById || {};\n  for (const [tableId, tableChanges] of Object.entries(changedTablesObj)) {\n    const cfg = TABLE_CONFIG.find(t => t.sourceTableId === tableId);\n    if (!cfg) continue;\n\n    const createdIds = Object.keys(tableChanges?.createdRecordsById || {});\n    const updatedIds = Object.keys(tableChanges?.changedRecordsById || {});\n\n    for (const id of createdIds) {\n      if (!recordMap.has(id)) recordMap.set(id, { cfg, type: 'created' });\n    }\n    for (const id of updatedIds) {\n      if (!recordMap.has(id)) recordMap.set(id, { cfg, type: 'updated' });\n    }\n  }\n}\n\nif (recordMap.size === 0) {\n  return [{ json: { __skip: true, message: 'No matching tables changed' } }];\n}\n\n// ============================================================\n// Wait 30 seconds for user to finish filling all fields\n// ============================================================\nawait new Promise(resolve => setTimeout(resolve, 30000));\n\nconst results = [];\n\nfor (const [recordId, { cfg, type }] of recordMap.entries()) {\n\n  // ============================================================\n  // API CALL 3 — Fetch the latest complete record from source\n  // ============================================================\n  let recordData;\n  try {\n    recordData = await this.helpers.httpRequest({\n      method: 'GET',\n      url: `https://api.airtable.com/v0/${cfg.sourceBaseId}/${cfg.sourceTableId}/${recordId}`,\n      headers: { 'Authorization': `Bearer ${AIRTABLE_TOKEN}` },\n      json: true\n    });\n  } catch (err) {\n    results.push({ json: { status: 'fetch_failed', record: recordId, error: err.message } });\n    continue;\n  }\n\n  const sourceFields = recordData.fields || {};\n  const fieldsToWrite = {};\n\n  for (const fieldName of cfg.fields) {\n    if (sourceFields[fieldName] !== undefined) {\n      fieldsToWrite[fieldName] = sourceFields[fieldName];\n    }\n  }\n\n  fieldsToWrite['_original_record_id'] = recordId;\n  fieldsToWrite['_synced_at'] = new Date().toISOString().replace('T', ' ').substring(0, 19);\n\n  // ============================================================\n  // API CALL 4 — Upsert into backup (creates OR updates)\n  // ============================================================\n  try {\n    await this.helpers.httpRequest({\n      method: 'PATCH',\n      url: `https://api.airtable.com/v0/${cfg.backupBaseId}/${cfg.backupTableId}`,\n      headers: {\n        'Authorization': `Bearer ${AIRTABLE_TOKEN}`,\n        'Content-Type': 'application/json'\n      },\n      body: {\n        performUpsert: {\n          fieldsToMergeOn: ['_original_record_id']\n        },\n        records: [{ fields: fieldsToWrite }]\n      },\n      json: true\n    });\n\n    results.push({\n      json: {\n        status: type,\n        record: recordId,\n        table: cfg.tableLabel,\n        fields: fieldsToWrite\n      }\n    });\n\n    console.log(`✅ ${type} record ${recordId} in ${cfg.tableLabel}`);\n\n  } catch (err) {\n    results.push({ json: { status: 'upsert_failed', record: recordId, error: err.message } });\n  }\n}\n\nreturn results.length > 0\n  ? results\n  : [{ json: { __skip: true, message: 'Nothing to sync' } }];"
+      },
+      "id": "f12e101b-087f-435f-854a-d0e463ba7ec2",
+      "name": "Fetch & Upsert All Changed Records",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -912,
+        -112
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "skip-check-001",
+              "leftValue": "={{ $json.__skip }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "bd3abc7a-a2ad-496a-aaab-7c1898a2d6f5",
+      "name": "If - Skip or Done?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        -576,
+        -112
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Just log the skipped result\nconst item = $input.first().json;\nconsole.log('Skipped:', item.message);\nreturn [{ json: { status: 'skipped', message: item.message } }];\n"
+      },
+      "id": "f8bc1606-4ad4-4e93-a8e3-8f15575eaf87",
+      "name": "Log Skip",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -256,
+        -272
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Log successful sync results\nconst items = $input.all();\nconst summary = items.map(i => ({\n  table: i.json.table,\n  record: i.json.record,\n  status: i.json.status\n}));\nconsole.log('Sync complete:', JSON.stringify(summary, null, 2));\nreturn items;\n"
+      },
+      "id": "dcc86dbd-2a45-40c9-995d-02437fad4a65",
+      "name": "Sync Complete",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -240,
+        0
+      ]
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Webhook - Airtable Trigger": {
+      "main": [
+        [
+          {
+            "node": "Fetch & Upsert All Changed Records",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch & Upsert All Changed Records": {
+      "main": [
+        [
+          {
+            "node": "If - Skip or Done?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If - Skip or Done?": {
+      "main": [
+        [
+          {
+            "node": "Log Skip",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Sync Complete",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false
+  },
+  "versionId": "a4807d26-5477-4efc-b6df-855bd365c3ca",
+  "meta": {
+    "instanceId": "ef7861b87ef2c05abf5aa26006f5df1068a0083130fa8abb44c07645db353bf1"
+  },
+  "id": "dbO4w64PdHZQY3tX",
+  "tags": []
+}
