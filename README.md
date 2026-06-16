@@ -1,28 +1,45 @@
-# 🔄 Airtable Real-Time Backup Automation (n8n)
+# Airtable Real-Time Backup Automation (n8n)
 
-An optimized n8n workflow that automatically backs up Airtable 
-records across bases using webhooks — in just 3–5 API calls.
+Real-time, webhook-triggered backup of Airtable records to a secondary
+base — optimized to run in 3–5 API calls per sync, with race-condition
+handling and duplicate prevention.
 
-## ⚙️ What It Does
-- Triggers instantly on any Airtable record change (webhook)
-- Syncs Products, Orders & Customers to a backup base
-- Prevents duplicates using upsert logic
-- Handles race conditions by acknowledging payloads immediately
-- Waits 30s for users to finish filling fields before syncing
+## How It Works
+Airtable record change
+↓
+Webhook fires instantly to n8n
+↓
+Payload acknowledged immediately (prevents race conditions)
+↓
+30s debounce — waits for user to finish editing all fields
+↓
+Upsert logic — checks backup base for existing record
+↓
+Record synced to backup base (Products / Orders / Customers)
+## Engineering Decisions
 
-## 🛠️ Tools Used
-- n8n (workflow automation)
-- Airtable API
-- Webhooks
+- **Immediate payload acknowledgment** — Airtable webhooks can fire
+  multiple times for a single edit session; acknowledging immediately
+  and debouncing downstream avoids dropped or duplicate triggers
+- **30-second debounce window** — prevents syncing a record mid-edit,
+  when only some fields have been filled in
+- **Upsert over insert** — avoids duplicate records when the same
+  change triggers multiple webhook events
+- **3–5 API call budget** — deliberately optimized against Airtable's
+  rate limits rather than calling the API per field or per table naively
 
-## 🚀 How to Use
-1. Import `airtable-backup-workflow.json` into your n8n instance
-2. Replace the API token and Base/Table IDs in the Code node
-3. Set up your Airtable webhook pointing to the n8n webhook URL
+## Tech Stack
+
+n8n · Airtable API · Webhooks
+
+## Setup
+
+1. Import `workflow.json` into n8n
+2. Replace API token and Base/Table IDs in the Code node
+3. Point an Airtable webhook to the n8n webhook URL
 4. Activate the workflow
 
-## 📌 Key Features
-- ✅ 3–5 API calls only (highly optimized)
-- ✅ Upsert logic — no duplicate records
-- ✅ Parallel execution safe
-- ✅ Works for multiple tables simultaneously
+## Tables Synced
+
+Products · Orders · Customers — extendable to additional tables by
+duplicating the sync branch in the workflow.
